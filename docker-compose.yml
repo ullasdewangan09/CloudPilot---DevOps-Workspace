@@ -1,0 +1,29 @@
+services:
+
+  redis:
+    image: redis:7
+
+    ports:
+      - "6379:6379"
+
+  auth-service:
+    build: ./backend/auth-service
+    env_file:
+      - ./backend/auth-service/.env
+    environment:
+      DATABASE_URL: postgresql://postgres:Rudramani*16@host.docker.internal:5432/CloudPilot
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: change_this_secret_in_production
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      API_BASE_URL: http://localhost:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      redis:
+        condition: service_started
+
