@@ -1,0 +1,67 @@
+===============================================================================
+                       CLOUDPILOT - DEVOPS WORKSPACE
+                             RUN & DEV COMMANDS
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. RUNNING THE BACKEND SERVICES MANUALLY (STANDALONE PYTHON)
+-------------------------------------------------------------------------------
+# Auth Service (Port 8000):
+cd backend/auth-service
+py -m uvicorn app.main:app --reload --port 8000
+
+# Cloud Service (Port 8001):
+cd backend/cloud-service
+py -m uvicorn app.main:app --reload --port 8001
+
+-------------------------------------------------------------------------------
+2. STARTING VIA DOCKER COMPOSE (RECOMMENDED CONTAINER MODE)
+-------------------------------------------------------------------------------
+# Start all microservices (Redis, Auth Service, Cloud Service) in detached mode:
+docker compose up -d
+
+# Build and start containers:
+docker compose up --build -d
+
+# View live container status:
+docker compose ps
+
+# View live container logs:
+docker compose logs -f cloud-service
+
+-------------------------------------------------------------------------------
+3. STOPPING THE PLATFORM
+-------------------------------------------------------------------------------
+# Stop all running containers:
+docker compose stop
+
+# Stop and remove containers and network:
+docker compose down
+
+-------------------------------------------------------------------------------
+4. TESTING & FEATURE VERIFICATION
+-------------------------------------------------------------------------------
+# Run Phase 3A Cloud Service Master Test Suite:
+$env:PYTHONUTF8=1; py C:\Users\dewan\.gemini\antigravity-ide\scratch\test_cloud_service.py
+
+# Run Auth & Workspace Feature Test Suite:
+py C:\Users\dewan\.gemini\antigravity-ide\scratch\test_all_features.py
+
+# Run Database Inspection Script:
+py C:\Users\dewan\.gemini\antigravity-ide\scratch\query_db.py
+
+-------------------------------------------------------------------------------
+5. INTERACTIVE PORTALS & DOCUMENTATION URLS
+-------------------------------------------------------------------------------
+# Auth Service Swagger API Docs:
+http://localhost:8000/docs
+
+# Cloud Service Swagger API Docs:
+http://localhost:8001/docs
+
+# Auth Web Login Portal:
+http://localhost:8000/login
+
+# Cloud Service Health Check Endpoint:
+http://localhost:8001/health
+===============================================================================

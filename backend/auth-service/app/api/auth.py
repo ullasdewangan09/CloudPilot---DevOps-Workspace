@@ -1,23 +1,9 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordRequestForm
-import httpx
-
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-
-from app.schemas.user import UserRegister
-from app.schemas.user import UserResponse
-
-from app.services.auth_service import create_user
-from app.schemas.user import UserLogin
-from app.schemas.user import TokenResponse
-from app.services.auth_service import authenticate_user
-from app.services.auth_service import get_or_create_social_user
-from app.core.security import create_access_token
-from app.core.security import get_current_user
-from app.models.user import User
 from app.core.config import (
     FRONTEND_SUCCESS_URL,
     GOOGLE_CLIENT_ID,
@@ -30,7 +16,22 @@ from app.core.config import (
     MICROSOFT_CLIENT_SECRET,
     MICROSOFT_REDIRECT_URI
 )
+from app.core.database import get_db
+from app.core.security import create_access_token, get_current_user
+from app.models.user import User
+from app.schemas.user import (
+    UserRegister,
+    UserResponse,
+    UserLogin,
+    TokenResponse
+)
+from app.services.auth_service import (
+    create_user,
+    authenticate_user,
+    get_or_create_social_user
+)
 from app.services.social_oauth_service import (
+    PROVIDER_CONFIG,
     fetch_github_profile,
     fetch_google_profile,
     fetch_microsoft_profile,
@@ -41,6 +42,7 @@ from app.services.social_oauth_service import (
 )
 
 router = APIRouter()
+
 
 
 def build_token_response(user: User):
@@ -529,10 +531,6 @@ async def social_callback(
 ):
     # Check if we are in mock mode
     is_mock = False
-    if code.startswith("mock_") or code == "mock":
-        is_mock = True
-
-    from app.services.social_oauth_service import PROVIDER_CONFIG
     config = PROVIDER_CONFIG.get(provider, {})
     if not config.get("client_id") or not config.get("client_secret"):
         is_mock = True

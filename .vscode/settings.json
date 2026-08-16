@@ -1,0 +1,11 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/backend/auth-service",
+    "${workspaceFolder}/backend/api-gateway"
+  ],
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}/backend/auth-service",
+    "${workspaceFolder}/backend/api-gateway"
+  ]
+}

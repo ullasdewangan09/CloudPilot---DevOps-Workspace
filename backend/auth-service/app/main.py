@@ -1,19 +1,5 @@
 from fastapi import FastAPI
-from app.api.auth import router as auth_router
-from app.api.workspaces import router as workspace_router
-from app.core.database import init_db
-
-init_db()
-
-app = FastAPI(
-    title="CloudPilot Backend",
-    version="1.0.0",
-    description="Cloud-native DevOps platform backend"
-)
-
-
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.workspaces import router as workspace_router
@@ -35,6 +21,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/login")
+
 
 
 
