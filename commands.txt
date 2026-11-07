@@ -41,14 +41,12 @@ docker compose down
 -------------------------------------------------------------------------------
 4. TESTING & FEATURE VERIFICATION
 -------------------------------------------------------------------------------
-# Run Phase 3A Cloud Service Master Test Suite:
-$env:PYTHONUTF8=1; py C:\Users\dewan\.gemini\antigravity-ide\scratch\test_cloud_service.py
+# Auth & Cloud Service Manual Acceptance Checklist:
+# Refer to: backend/tests/manual_acceptance_checklist.md
 
-# Run Auth & Workspace Feature Test Suite:
-py C:\Users\dewan\.gemini\antigravity-ide\scratch\test_all_features.py
-
-# Run Database Inspection Script:
-py C:\Users\dewan\.gemini\antigravity-ide\scratch\query_db.py
+# Health check endpoints:
+curl http://localhost:8000/docs
+curl http://localhost:8001/health
 
 -------------------------------------------------------------------------------
 5. INTERACTIVE PORTALS & DOCUMENTATION URLS
