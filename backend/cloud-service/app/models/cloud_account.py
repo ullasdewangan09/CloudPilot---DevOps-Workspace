@@ -71,15 +71,15 @@ class CloudAccount(Base):
         nullable=True
     )
 
-    # AWS-specific: IAM Role ARN for cross-account access (Phase 3B+)
+    # AWS-specific: IAM Role ARN for cross-account access (Fernet encrypted)
     role_arn = Column(
-        String(500),
+        Text,
         nullable=True
     )
 
-    # AWS-specific: External ID for STS AssumeRole security (Phase 3B+)
+    # AWS-specific: External ID for STS AssumeRole security (Fernet encrypted)
     external_id = Column(
-        String(255),
+        Text,
         nullable=True
     )
 

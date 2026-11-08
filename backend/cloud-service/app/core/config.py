@@ -27,7 +27,7 @@ def _required_env(name: str) -> str:
     return value
 
 
-DATABASE_URL = _required_env("DATABASE_URL")
+DATABASE_URL = os.getenv("TEST_DATABASE_URL") or _required_env("DATABASE_URL")
 JWT_SECRET = _required_env("JWT_SECRET")
 
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
@@ -35,3 +35,4 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 
 PORT = int(os.getenv("PORT", 8001))
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8001")
+FERNET_KEY = os.getenv("FERNET_KEY") or os.getenv("ENCRYPTION_KEY", "9AHRW3AtKGsdZ6BIELRR4NjPRHFjOfRggwI9Tu0T9zI=")

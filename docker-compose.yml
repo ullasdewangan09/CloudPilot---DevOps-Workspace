@@ -2,19 +2,26 @@ services:
 
   redis:
     image: redis:7
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   auth-service:
     build: ./backend/auth-service
+    restart: unless-stopped
     env_file:
       - ./backend/auth-service/.env
     environment:
-      DATABASE_URL: postgresql://postgres:Rudramani*16@host.docker.internal:5432/CloudPilot
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@host.docker.internal:5432/CloudPilot}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: cloudpilot_secret
-      JWT_ALGORITHM: HS256
-      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      JWT_SECRET: ${JWT_SECRET:-cloudpilot_secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
       API_BASE_URL: http://localhost:8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -22,18 +29,25 @@ services:
       - "8000:8000"
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   cloud-service:
     build: ./backend/cloud-service
+    restart: unless-stopped
     env_file:
       - ./backend/cloud-service/.env
     environment:
-      DATABASE_URL: postgresql://postgres:Rudramani*16@host.docker.internal:5432/CloudPilot
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@host.docker.internal:5432/CloudPilot}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: cloudpilot_secret
-      JWT_ALGORITHM: HS256
-      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      JWT_SECRET: ${JWT_SECRET:-cloudpilot_secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      FERNET_KEY: ${FERNET_KEY:-9AHRW3AtKGsdZ6BIELRR4NjPRHFjOfRggwI9Tu0T9zI=}
       PORT: 8001
       API_BASE_URL: http://localhost:8001
     extra_hosts:
@@ -42,4 +56,9 @@ services:
       - "8001:8001"
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8001/health\")'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3

@@ -29,7 +29,7 @@ def _required_env(name: str) -> str:
     return value
 
 
-DATABASE_URL = _required_env("DATABASE_URL")
+DATABASE_URL = os.getenv("TEST_DATABASE_URL") or _required_env("DATABASE_URL")
 JWT_SECRET = _required_env("JWT_SECRET")
 
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")

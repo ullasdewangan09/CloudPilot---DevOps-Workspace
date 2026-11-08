@@ -2,12 +2,14 @@ import uuid
 from typing import Tuple, Optional, List
 
 from fastapi import HTTPException, status
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Boolean
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Session, declarative_base
 
 from app.models.cloud_account import CloudAccount
 from app.schemas.cloud_account import CloudAccountCreate, CloudAccountUpdate
+from app.core.security import encrypt_credential, decrypt_credential
+from app.providers.aws import AWSProvider
 
 # ── RBAC configuration ──────────────────────────────────────────────────────
 WRITE_ROLES = {"owner", "admin"}
@@ -31,7 +33,7 @@ class _WorkspaceRef(_Base):
     __tablename__ = "workspaces"
     id = Column(PG_UUID(as_uuid=True), primary_key=True)
     owner_id = Column(Integer, nullable=False)
-    is_active = Column(Integer, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
 
 
 # ── Workspace authorization helpers ─────────────────────────────────────────
@@ -101,16 +103,34 @@ def create_cloud_account(
 ) -> CloudAccount:
     _require_workspace_access(db, data.workspace_id, current_user_id, require_write=True)
 
+    # Initial status and provider credential validation
+    account_status = "pending"
+    if data.provider.lower() == "aws":
+        provider = AWSProvider(
+            role_arn=data.role_arn,
+            external_id=data.external_id,
+            region=data.default_region or "us-east-1"
+        )
+        if data.role_arn:
+            if provider.validate_credentials():
+                account_status = "active"
+            else:
+                account_status = "error"
+
+    # Encrypt sensitive credentials using Fernet before persisting to PostgreSQL
+    encrypted_role_arn = encrypt_credential(data.role_arn)
+    encrypted_external_id = encrypt_credential(data.external_id)
+
     account = CloudAccount(
         workspace_id=data.workspace_id,
-        provider=data.provider,
+        provider=data.provider.lower(),
         name=data.name,
         account_id=data.account_id,
         default_region=data.default_region,
-        role_arn=data.role_arn,
-        external_id=data.external_id,
+        role_arn=encrypted_role_arn,
+        external_id=encrypted_external_id,
         description=data.description,
-        status="pending",
+        status=account_status,
         is_active=True
     )
     db.add(account)
@@ -187,6 +207,22 @@ def update_cloud_account(
     _require_workspace_access(db, account.workspace_id, current_user_id, require_write=True)
 
     update_data = data.model_dump(exclude_unset=True)
+
+    # Protect against accidental overwrite of encrypted credentials with empty or masked values
+    if "role_arn" in update_data:
+        val = update_data["role_arn"]
+        if val and not val.startswith("***") and val.strip():
+            update_data["role_arn"] = encrypt_credential(val)
+        else:
+            del update_data["role_arn"]
+
+    if "external_id" in update_data:
+        val = update_data["external_id"]
+        if val and not val.startswith("***") and val.strip():
+            update_data["external_id"] = encrypt_credential(val)
+        else:
+            del update_data["external_id"]
+
     for field, value in update_data.items():
         setattr(account, field, value)
 

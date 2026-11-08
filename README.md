@@ -124,6 +124,37 @@ When services are running, interactive Swagger OpenAPI documentation is availabl
 
 ---
 
+## Automated Testing & CI/CD (Phase 4A)
+
+CloudPilot maintains an automated regression testing framework built with `pytest`, `pytest-cov`, and `httpx`.
+
+All tests execute against an isolated test database (`cloudpilot_test`) to ensure zero impact on development data.
+
+### 1. Run Complete Test Suite
+```bash
+python run_tests.py
+```
+This executes all service test suites, measures line & branch coverage, and prints a consolidated pass/fail report.
+
+### 2. Run Individual Service Suites
+```bash
+# Run Auth & Workspace Service tests:
+pytest backend/auth-service/tests -v
+
+# Run Cloud Service tests:
+pytest backend/cloud-service/tests -v
+```
+
+### 3. Continuous Integration (CI)
+GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
+- Spins up an isolated PostgreSQL 16 container.
+- Installs dependencies on Python 3.12.
+- Executes all 46 automated regression tests.
+- Enforces credential encryption, workspace RBAC, and multi-tenancy isolation.
+
+---
+
 ## Quick Reference Commands
 
 Refer to [`commands.txt`](./commands.txt) for a complete list of execution commands, Docker management workflows, and service URLs.
+

@@ -39,9 +39,27 @@ docker compose stop
 docker compose down
 
 -------------------------------------------------------------------------------
-4. TESTING & FEATURE VERIFICATION
+4. AUTOMATED REGRESSION TESTING (PHASE 4A)
 -------------------------------------------------------------------------------
-# Auth & Cloud Service Manual Acceptance Checklist:
+# Target isolated test database (zero impact on CloudPilot dev db):
+# TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/cloudpilot_test
+
+# Run entire test suite across all services with coverage:
+python run_tests.py
+
+# Run Auth & Workspace Service tests only:
+pytest backend/auth-service/tests -v
+
+# Run Cloud Service tests only:
+pytest backend/cloud-service/tests -v
+
+# Measure coverage for Auth Service:
+pytest backend/auth-service/tests --cov=app --cov-report=term-missing
+
+# Measure coverage for Cloud Service:
+pytest backend/cloud-service/tests --cov=app --cov-report=term-missing
+
+# Manual Acceptance Checklist:
 # Refer to: backend/tests/manual_acceptance_checklist.md
 
 # Health check endpoints:

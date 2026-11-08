@@ -33,12 +33,6 @@ def init_db():
     from app.models.user import User
     from app.models.workspace import Workspace, WorkspaceMember, WorkspaceAuditLog
 
-    with engine.begin() as connection:
-        # Drop old workspaces and dependent tables to apply updated schemas
-        connection.execute(text("DROP TABLE IF EXISTS workspace_members CASCADE;"))
-        connection.execute(text("DROP TABLE IF EXISTS workspace_audit_logs CASCADE;"))
-        connection.execute(text("DROP TABLE IF EXISTS workspaces CASCADE;"))
-
     Base.metadata.create_all(
         bind=engine,
         tables=[

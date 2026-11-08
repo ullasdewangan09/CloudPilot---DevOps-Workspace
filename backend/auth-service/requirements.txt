@@ -11,4 +11,3 @@ email-validator
 python-dotenv
 redis
 httpx
-python-jose[cryptography]
