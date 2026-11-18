@@ -26,7 +26,7 @@ from app.schemas.cloud_resource import (
 from app.core.security import encrypt_credential, decrypt_credential
 from app.core.database import SessionLocal
 from app.core.cache import cache_manager
-from app.core.config import CACHE_TTL_SUMMARY, CACHE_TTL_LIST
+from app.core.config import CACHE_TTL_SUMMARY, CACHE_TTL_LIST, CACHE_TTL_SYNC_STATUS
 from app.providers.aws import AWSProvider
 from app.providers.aws.session import AWSSessionManager, AWSSessionError
 from app.services.resource_sync import ResourceSyncEngine, AsyncSyncRunner, ConcurrentSyncError
@@ -429,15 +429,29 @@ def trigger_account_sync(
 def get_sync_status(
     db: Session,
     current_user_id: int,
-    account_id: uuid.UUID
+    account_id: uuid.UUID,
+    bypass_cache: bool = False
 ) -> SyncStatusResponse:
     """
-    Returns the latest synchronization status for a cloud account.
+    Returns the latest synchronization status for a cloud account with Redis caching.
     Readable by all workspace members (Owner, Admin, Developer, Viewer).
     """
     account = get_cloud_account(db, current_user_id, account_id)
     _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
 
+    gen = cache_manager.get_generation(account.workspace_id, account.id)
+    cache_key = cache_manager.build_sync_status_key(account.workspace_id, account.id, generation=gen)
+
+    # 1. Check cache (unless explicitly bypassed)
+    if not bypass_cache:
+        cached_data = cache_manager.get(cache_key)
+        if cached_data and isinstance(cached_data, dict):
+            try:
+                return SyncStatusResponse.model_validate(cached_data)
+            except Exception as exc:
+                logger.warning(f"Malformed sync status cache for key '{cache_key}': {exc}.")
+
+    # 2. Query PostgreSQL (Source of Truth)
     engine = ResourceSyncEngine(db)
     engine.recover_zombie_jobs(account.id)
 
@@ -450,12 +464,22 @@ def get_sync_status(
         CloudSyncJob.cloud_account_id == account.id
     ).order_by(CloudSyncJob.started_at.desc()).first()
 
-    return SyncStatusResponse(
+    response = SyncStatusResponse(
         cloud_account_id=account.id,
         has_active_job=bool(active_job),
         active_job=active_job,
         latest_job=latest_job
     )
+
+    # 3. Populate Redis Cache only if generation has not changed during read
+    current_gen = cache_manager.get_generation(account.workspace_id, account.id)
+    if current_gen == gen:
+        try:
+            cache_manager.set(cache_key, response.model_dump(), ttl=CACHE_TTL_SYNC_STATUS)
+        except Exception as exc:
+            logger.warning(f"Failed to cache sync status for key '{cache_key}': {exc}")
+
+    return response
 
 
 def list_sync_jobs(
@@ -534,16 +558,24 @@ def list_resources(
     account = get_cloud_account(db, current_user_id, account_id)
     _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
 
+    # Normalize query filters for canonical cache key generation
+    norm_resource_type = resource_type.lower().strip() if resource_type and resource_type.strip() else None
+    norm_region = region.lower().strip() if region and region.strip() else None
+    norm_status = status_filter.lower().strip() if status_filter and status_filter.strip() else None
+    norm_search = search.strip() if search and search.strip() else None
+
     cache_params = {
         "page": page,
         "limit": limit,
-        "resource_type": resource_type,
-        "region": region,
-        "status": status_filter,
-        "search": search,
-        "include_deleted": include_deleted,
+        "resource_type": norm_resource_type,
+        "region": norm_region,
+        "status": norm_status,
+        "search": norm_search,
+        "include_deleted": bool(include_deleted),
     }
-    cache_key = cache_manager.build_list_key(account.workspace_id, account.id, cache_params)
+
+    gen = cache_manager.get_generation(account.workspace_id, account.id)
+    cache_key = cache_manager.build_list_key(account.workspace_id, account.id, cache_params, generation=gen)
 
     # 1. Check cache (unless explicitly bypassed)
     if not bypass_cache:
@@ -563,17 +595,17 @@ def list_resources(
     if not include_deleted:
         query = query.filter(CloudResource.is_deleted == False)
 
-    if resource_type:
-        query = query.filter(CloudResource.resource_type == resource_type.lower().strip())
+    if norm_resource_type:
+        query = query.filter(CloudResource.resource_type == norm_resource_type)
 
-    if region:
-        query = query.filter(CloudResource.region == region.lower().strip())
+    if norm_region:
+        query = query.filter(CloudResource.region == norm_region)
 
-    if status_filter:
-        query = query.filter(CloudResource.status == status_filter.lower().strip())
+    if norm_status:
+        query = query.filter(CloudResource.status == norm_status)
 
-    if search:
-        term = f"%{search.strip()}%"
+    if norm_search:
+        term = f"%{norm_search}%"
         query = query.filter(
             or_(
                 CloudResource.name.ilike(term),
@@ -585,16 +617,23 @@ def list_resources(
     offset = (page - 1) * limit
     items = query.order_by(CloudResource.created_at.desc()).offset(offset).limit(limit).all()
 
-    # 3. Populate Redis Cache
-    try:
-        serialized_items = [CloudResourceResponse.model_validate(item).model_dump() for item in items]
-        cache_manager.set(
-            cache_key,
-            {"items": serialized_items, "total": total},
-            ttl=CACHE_TTL_LIST
+    # 3. Populate Redis Cache only if generation has not changed during database read
+    current_gen = cache_manager.get_generation(account.workspace_id, account.id)
+    if current_gen == gen:
+        try:
+            serialized_items = [CloudResourceResponse.model_validate(item).model_dump() for item in items]
+            cache_manager.set(
+                cache_key,
+                {"items": serialized_items, "total": total},
+                ttl=CACHE_TTL_LIST
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to cache resource listing for key '{cache_key}': {exc}")
+    else:
+        logger.info(
+            f"Skipping stale list cache population for account {account.id}: "
+            f"generation changed from {gen} to {current_gen} during DB read."
         )
-    except Exception as exc:
-        logger.warning(f"Failed to cache resource listing for key '{cache_key}': {exc}")
 
     return items, total
 
@@ -644,7 +683,10 @@ def get_resource_summary(
     account = get_cloud_account(db, current_user_id, account_id)
     _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
 
-    cache_key = cache_manager.build_summary_key(account.workspace_id, account.id, include_deleted=include_deleted)
+    gen = cache_manager.get_generation(account.workspace_id, account.id)
+    cache_key = cache_manager.build_summary_key(
+        account.workspace_id, account.id, include_deleted=include_deleted, generation=gen
+    )
 
     # 1. Check cache (unless explicitly bypassed)
     if not bypass_cache:
@@ -713,11 +755,18 @@ def get_resource_summary(
         by_status=by_status
     )
 
-    # 3. Populate Redis Cache
-    try:
-        cache_manager.set(cache_key, summary.model_dump(), ttl=CACHE_TTL_SUMMARY)
-    except Exception as exc:
-        logger.warning(f"Failed to cache resource summary for key '{cache_key}': {exc}")
+    # 3. Populate Redis Cache only if generation has not changed during database read
+    current_gen = cache_manager.get_generation(account.workspace_id, account.id)
+    if current_gen == gen:
+        try:
+            cache_manager.set(cache_key, summary.model_dump(), ttl=CACHE_TTL_SUMMARY)
+        except Exception as exc:
+            logger.warning(f"Failed to cache resource summary for key '{cache_key}': {exc}")
+    else:
+        logger.info(
+            f"Skipping stale summary cache population for account {account.id}: "
+            f"generation changed from {gen} to {current_gen} during DB read."
+        )
 
     return summary
 

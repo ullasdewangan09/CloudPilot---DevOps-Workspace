@@ -152,7 +152,7 @@ pytest backend/cloud-service/tests/test_resource_sync.py -k "test_stale_job_reco
 # Payload: {"sync_type": "full"}  (supports "full", "ec2", "s3", "vpc", "rds")
 
 # Sync Status & Historical Job Tracking (All Workspace Members):
-# GET /api/v1/cloud/accounts/{account_id}/sync/status
+# GET /api/v1/cloud/accounts/{account_id}/sync/status?bypass_cache=false
 # GET /api/v1/cloud/accounts/{account_id}/sync/jobs?page=1&limit=10&status=completed
 # GET /api/v1/cloud/accounts/{account_id}/sync/jobs/{job_id}
 
@@ -170,10 +170,11 @@ pytest backend/cloud-service/tests/test_resource_sync.py -k "test_stale_job_reco
 # tenant isolation, post-commit cache eviction, and 100% graceful fallback to PostgreSQL.
 #
 # Key Features:
-# - Connection pooling with connect/socket timeouts (2.0s) & max pool size (20)
+# - Connection pooling with connect/socket timeouts (2.0s), max pool size (20), & circuit breaker reconnect cooldown (5.0s)
 # - Bounded TTLs: Summary (300s), Resource Listings (120s), Sync Status (30s)
 # - Strict multi-tenant isolation: Keys partitioned by workspace_id and account_id
 # - Versioned namespace: cloudpilot:v1:*
+# - Versioned cache generations (cloudpilot:v1:gen:<ws_id>:<account_id>) eliminating concurrent read-after-invalidate race conditions
 # - Fail-open resilience: Redis failures log warnings; APIs seamlessly fall back to DB
 # - Security guarantee: Zero IAM Role ARNs, External IDs, or STS tokens in Redis
 # - Authorization verified in PostgreSQL before any cache lookup

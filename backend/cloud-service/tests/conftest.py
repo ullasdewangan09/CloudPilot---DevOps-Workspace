@@ -72,10 +72,10 @@ def clean_database():
     # Clean up Redis test keys if Redis is available
     try:
         from app.core.cache import cache_manager
-        if cache_manager.client:
-            keys = list(cache_manager.client.scan_iter("cloudpilot:v1:*"))
+        if cache_manager._is_connected and cache_manager._client:
+            keys = list(cache_manager._client.scan_iter("cloudpilot:v1:*"))
             if keys:
-                cache_manager.client.delete(*keys)
+                cache_manager._client.delete(*keys)
     except Exception:
         pass
 

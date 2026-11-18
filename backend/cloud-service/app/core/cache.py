@@ -17,6 +17,7 @@ Responsibilities:
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
 from datetime import datetime, date
@@ -57,6 +58,9 @@ logger = logging.getLogger(__name__)
 KEY_VERSION = "v1"
 KEY_PREFIX = f"cloudpilot:{KEY_VERSION}"
 
+# Circuit-breaker reconnect cooldown when Redis is unreachable (seconds)
+RECONNECT_COOLDOWN_SECONDS = 5.0
+
 
 def json_serializer(obj: Any) -> Any:
     """JSON serializer for objects not serializable by default json code."""
@@ -71,7 +75,8 @@ def json_serializer(obj: Any) -> Any:
 
 class RedisCacheManager:
     """
-    Resilient Redis client manager with connection pooling and graceful error handling.
+    Resilient Redis client manager with connection pooling, reconnect throttling,
+    versioned generation counters, and graceful error handling.
     """
 
     def __init__(self):
@@ -79,6 +84,8 @@ class RedisCacheManager:
         self._pool: Optional[Any] = None
         self._client: Optional[Any] = None
         self._is_connected: bool = False
+        self._last_connect_attempt: float = 0.0
+        self._reconnect_cooldown: float = RECONNECT_COOLDOWN_SECONDS
 
     def get_masked_url(self) -> str:
         """Returns safe representation of Redis URL with credentials redacted."""
@@ -91,14 +98,23 @@ class RedisCacheManager:
             return f"{scheme}://***:***@{rest}"
         return REDIS_URL
 
-    def connect(self) -> bool:
+    def connect(self, force: bool = False) -> bool:
         """
         Initializes the Redis connection pool.
+        Uses circuit-breaker reconnect throttling to prevent repetitive socket delays
+        when Redis is offline.
         Returns True if connection succeeded, False if Redis is disabled or unreachable.
         """
         if not self.enabled:
             logger.info("Redis caching is disabled via configuration.")
             return False
+
+        now = time.time()
+        # Throttled reconnect: skip socket timeout attempts if previous attempt failed recently
+        if not force and not self._is_connected and (now - self._last_connect_attempt) < self._reconnect_cooldown:
+            return False
+
+        self._last_connect_attempt = now
 
         try:
             # Use connection pool for high-concurrency connection reuse
@@ -173,44 +189,100 @@ class RedisCacheManager:
 
     @property
     def client(self) -> Optional[Any]:
-        """Lazy access to Redis client with automatic reconnect attempt."""
+        """Lazy access to Redis client with automatic throttled reconnect attempt."""
         if not self.enabled:
             return None
         if self._client is None or not self._is_connected:
             self.connect()
         return self._client
 
+    # ── Versioned Generation Counters (Race Condition Prevention) ────────────
+
+    def bump_generation(self, workspace_id: uuid.UUID, account_id: uuid.UUID) -> int:
+        """
+        Atomically increments the cache generation counter for this tenant account.
+        Any in-flight concurrent reads holding an older generation will be rejected on write
+        or isolated from subsequent readers.
+        Returns the new generation number.
+        """
+        cli = self.client
+        if not cli:
+            return 1
+        gen_key = f"{KEY_PREFIX}:gen:{workspace_id}:{account_id}"
+        try:
+            new_gen = cli.incr(gen_key)
+            if new_gen == 1:
+                new_gen = cli.incr(gen_key)
+            # Set a 30-day TTL on generation key to prevent permanent Redis memory growth
+            try:
+                cli.expire(gen_key, 2592000)
+            except Exception:
+                pass
+            return int(new_gen)
+        except Exception as exc:
+            logger.warning(f"Failed to increment cache generation for account {account_id}: {exc}")
+            return 1
+
+    def get_generation(self, workspace_id: uuid.UUID, account_id: uuid.UUID) -> int:
+        """
+        Fetches the current cache generation counter for this tenant account.
+        Defaults to 1 if not set or Redis is unavailable.
+        """
+        cli = self.client
+        if not cli:
+            return 1
+        gen_key = f"{KEY_PREFIX}:gen:{workspace_id}:{account_id}"
+        try:
+            val = cli.get(gen_key)
+            return int(val) if val is not None else 1
+        except Exception as exc:
+            logger.warning(f"Failed to fetch cache generation for account {account_id}: {exc}")
+            return 1
+
     # ── Key Generation Functions ─────────────────────────────────────────────
 
     @staticmethod
-    def build_summary_key(workspace_id: uuid.UUID, account_id: uuid.UUID, include_deleted: bool = False) -> str:
-        """Builds cache key for resource summaries."""
+    def build_summary_key(
+        workspace_id: uuid.UUID,
+        account_id: uuid.UUID,
+        include_deleted: bool = False,
+        generation: Optional[int] = None
+    ) -> str:
+        """Builds versioned cache key for resource summaries."""
+        gen = generation if generation is not None else 1
         del_flag = 1 if include_deleted else 0
-        return f"{KEY_PREFIX}:resources:summary:{workspace_id}:{account_id}:{del_flag}"
+        return f"{KEY_PREFIX}:resources:summary:{workspace_id}:{account_id}:{gen}:{del_flag}"
 
     @staticmethod
     def build_list_key(
         workspace_id: uuid.UUID,
         account_id: uuid.UUID,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        generation: Optional[int] = None
     ) -> str:
         """
-        Builds deterministic cache key for filtered resource listings using SHA-256 query hash.
+        Builds deterministic versioned cache key for filtered resource listings using SHA-256 query hash.
         """
-        # Normalize params: sort keys, remove None, convert UUIDs to string
+        gen = generation if generation is not None else 1
+        # Normalize params: sort keys, remove None and empty strings, convert UUIDs to string
         norm_params = {
             str(k): (str(v) if isinstance(v, uuid.UUID) else v)
             for k, v in sorted(params.items())
-            if v is not None
+            if v is not None and v != ""
         }
         serialized = json.dumps(norm_params, sort_keys=True)
         query_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
-        return f"{KEY_PREFIX}:resources:list:{workspace_id}:{account_id}:{query_hash}"
+        return f"{KEY_PREFIX}:resources:list:{workspace_id}:{account_id}:{gen}:{query_hash}"
 
     @staticmethod
-    def build_sync_status_key(workspace_id: uuid.UUID, account_id: uuid.UUID) -> str:
-        """Builds cache key for sync status."""
-        return f"{KEY_PREFIX}:sync:status:{workspace_id}:{account_id}"
+    def build_sync_status_key(
+        workspace_id: uuid.UUID,
+        account_id: uuid.UUID,
+        generation: Optional[int] = None
+    ) -> str:
+        """Builds versioned cache key for sync status."""
+        gen = generation if generation is not None else 1
+        return f"{KEY_PREFIX}:sync:status:{workspace_id}:{account_id}:{gen}"
 
     # ── Core Cache Operations ────────────────────────────────────────────────
 
@@ -259,13 +331,37 @@ class RedisCacheManager:
             logger.warning(f"Redis delete failed for key '{key}': {exc}")
             return False
 
+    def invalidate_sync_status(self, workspace_id: uuid.UUID, account_id: uuid.UUID) -> bool:
+        """
+        Invalidates specifically the sync status cache keys for an account.
+        Invoked on every job state transition (PENDING, RUNNING, COMPLETED, FAILED, ZOMBIE RECOVERY).
+        """
+        cli = self.client
+        if not cli:
+            return False
+        pattern = f"{KEY_PREFIX}:sync:status:{workspace_id}:{account_id}*"
+        try:
+            keys = list(cli.scan_iter(match=pattern, count=20))
+            if keys:
+                cli.delete(*keys)
+                logger.debug(f"Invalidated {len(keys)} sync status keys for account {account_id}.")
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate sync status cache for account {account_id}: {exc}")
+            return False
+
     def invalidate_account_cache(self, workspace_id: uuid.UUID, account_id: uuid.UUID) -> int:
         """
         Invalidates all cached data (summaries, listings, sync status) strictly belonging
         to the specified workspace and cloud account pair.
+        1. Atomically bumps generation counter to reject in-flight concurrent read writes.
+        2. Deletes existing cached data keys, preserving the generation counter key.
         Never touches keys belonging to other workspaces or accounts.
         Returns the count of invalidated keys.
         """
+        # 1. Atomically increment generation counter (prevents stale write race conditions)
+        self.bump_generation(workspace_id, account_id)
+
         cli = self.client
         if not cli:
             return 0
@@ -275,8 +371,11 @@ class RedisCacheManager:
         invalidated_count = 0
 
         try:
-            # Use scan_iter for non-blocking cursor-based iteration
-            keys = list(cli.scan_iter(match=pattern, count=100))
+            # Use scan_iter for non-blocking cursor-based iteration, preserving :gen: counter
+            keys = [
+                k for k in cli.scan_iter(match=pattern, count=100)
+                if f":gen:{workspace_id}:{account_id}" not in k
+            ]
             if keys:
                 invalidated_count = cli.delete(*keys)
                 logger.info(

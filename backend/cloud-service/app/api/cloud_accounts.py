@@ -198,14 +198,16 @@ def sync_account_resources(
 )
 def get_account_sync_status(
     account_id: uuid.UUID,
+    bypass_cache: bool = Query(default=False, description="Bypass Redis cache and force fresh database lookup"),
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Returns latest synchronization state and currently running job (if any).
+    Uses Redis caching with PostgreSQL fallback.
     Accessible to all workspace members (Owner, Admin, Developer, Viewer).
     """
-    return get_sync_status(db, current_user.id, account_id)
+    return get_sync_status(db, current_user.id, account_id, bypass_cache=bypass_cache)
 
 
 @router.get(

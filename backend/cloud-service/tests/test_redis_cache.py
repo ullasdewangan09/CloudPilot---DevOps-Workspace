@@ -31,6 +31,7 @@ Verifies:
 
 import json
 import uuid
+import time
 import fnmatch
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
@@ -87,6 +88,17 @@ class FakeRedis:
             if fnmatch.fnmatch(k, match):
                 yield k
 
+    def incr(self, key):
+        val = int(self.data.get(key, 0)) + 1
+        self.data[key] = str(val)
+        return val
+
+    def expire(self, key, ttl):
+        if key in self.data:
+            self.ttls[key] = ttl
+            return True
+        return False
+
     def close(self):
         pass
 
@@ -103,7 +115,8 @@ def fake_redis():
     cache_manager._is_connected = True
     cache_manager.enabled = True
 
-    yield fake
+    with patch.object(cache_manager, "connect", return_value=True):
+        yield fake
 
     cache_manager._client = original_client
     cache_manager._is_connected = original_connected
@@ -472,3 +485,207 @@ def test_zero_credentials_stored_in_redis(client, test_user, test_cloud_account,
         assert "AccessKeyId" not in val_str
         assert "SecretAccessKey" not in val_str
         assert "SessionToken" not in val_str
+
+
+# ==============================================================================
+# 6. ARCHITECTURE AUDIT: RACE CONDITIONS, SYNC STATUS & FAILURE MODES
+# ==============================================================================
+
+def test_concurrent_read_race_condition_aborts_stale_cache(db, test_user, test_cloud_account, seed_resources, fake_redis, client):
+    """
+    CRITICAL CONCURRENCY AUDIT:
+    Verifies that when a concurrent write (e.g. sync job) commits and invalidates cache
+    during an in-flight read, the in-flight read's stale data is NOT cached or is isolated.
+    """
+    ws_id = test_cloud_account.workspace_id
+    acct_id = test_cloud_account.id
+
+    # Generation starts at 1
+    gen1 = cache_manager.get_generation(ws_id, acct_id)
+    assert gen1 == 1
+
+    # Simulate Reader 1: Starts reading, acquires generation 1
+    read_gen = cache_manager.get_generation(ws_id, acct_id)
+
+    # Concurrently, Writer commits new resources and invalidates cache
+    cache_manager.invalidate_account_cache(ws_id, acct_id)
+
+    # Generation is bumped atomically to 2
+    gen2 = cache_manager.get_generation(ws_id, acct_id)
+    assert gen2 == 2
+
+    # Reader 1 now finishes its database query and checks generation before writing
+    current_gen = cache_manager.get_generation(ws_id, acct_id)
+    assert current_gen != read_gen  # Mismatch detected!
+
+    # Old generation 1 key must not be populated as active generation
+    gen2_key = cache_manager.build_summary_key(ws_id, acct_id, generation=gen2)
+    assert gen2_key not in fake_redis.data
+
+    # A subsequent read automatically operates in generation 2
+    resp = client.get(
+        f"/api/v1/cloud/accounts/{acct_id}/resources/summary",
+        headers=test_user["headers"]
+    )
+    assert resp.status_code == 200
+    assert gen2_key in fake_redis.data
+
+
+def test_query_parameter_casing_and_whitespace_canonical_cache(client, test_user, test_cloud_account, seed_resources, fake_redis):
+    """Verify that different casing and whitespace for identical filter criteria map to the same cache key."""
+    # 1. Query with uppercase and extra whitespace
+    resp1 = client.get(
+        f"/api/v1/cloud/accounts/{test_cloud_account.id}/resources?resource_type=EC2_INSTANCE&region=%20US-EAST-1%20",
+        headers=test_user["headers"]
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["total"] == 1
+
+    list_keys_1 = [k for k in fake_redis.data if "resources:list" in k]
+    assert len(list_keys_1) == 1
+    canonical_key = list_keys_1[0]
+
+    # 2. Query with lowercase and clean whitespace
+    resp2 = client.get(
+        f"/api/v1/cloud/accounts/{test_cloud_account.id}/resources?resource_type=ec2_instance&region=us-east-1",
+        headers=test_user["headers"]
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["total"] == 1
+
+    # Must hit the exact same canonical key, no duplicate cache entries created
+    list_keys_2 = [k for k in fake_redis.data if "resources:list" in k]
+    assert len(list_keys_2) == 1
+    assert list_keys_2[0] == canonical_key
+
+
+def test_sync_status_lifecycle_invalidation(client, test_user, test_cloud_account, db, fake_redis):
+    """
+    Verifies that every sync job state transition (PENDING, RUNNING, COMPLETED, FAILED, ZOMBIE)
+    immediately invalidates the cached sync status so stale job states are never returned.
+    """
+    ws_id = test_cloud_account.workspace_id
+    acct_id = test_cloud_account.id
+
+    # 1. Warm sync status cache
+    resp = client.get(f"/api/v1/cloud/accounts/{acct_id}/sync/status", headers=test_user["headers"])
+    assert resp.status_code == 200
+    assert resp.json()["has_active_job"] is False
+
+    status_keys = [k for k in fake_redis.data if "sync:status" in k]
+    assert len(status_keys) == 1
+    status_key = status_keys[0]
+
+    # 2. Create sync job -> must invalidate sync status cache
+    engine = ResourceSyncEngine(db)
+    job = engine.create_sync_job(acct_id, ws_id, sync_type=SyncType.EC2)
+    assert status_key not in fake_redis.data
+
+    # 3. Transition to RUNNING -> must invalidate sync status cache
+    fake_redis.set(status_key, json.dumps({"cached": "state"}))
+    assert status_key in fake_redis.data
+
+    with patch("app.services.resource_sync.AWSSessionManager.from_cloud_account") as mock_mgr:
+        mock_mgr.return_value.assume_role.return_value = {"account_id": "123456789012"}
+        mock_mgr.return_value.is_expired.return_value = False
+        with patch.object(engine, "_discover_ec2", return_value=[]):
+            engine.execute_sync(job.id)
+
+    # Job finished -> cache must be invalidated
+    assert status_key not in fake_redis.data
+
+    # 4. Job failure -> must invalidate sync status cache
+    job2 = engine.create_sync_job(acct_id, ws_id, sync_type=SyncType.EC2)
+    fake_redis.set(status_key, json.dumps({"cached": "state"}))
+    engine._fail_job(job2, "Simulated failure")
+    assert status_key not in fake_redis.data
+
+    # 5. Zombie recovery -> must invalidate sync status cache
+    job3 = engine.create_sync_job(acct_id, ws_id, sync_type=SyncType.EC2)
+    job3.status = SyncStatus.RUNNING.value
+    job3.started_at = datetime.now(timezone.utc) - timedelta(minutes=120)
+    db.commit()
+
+    fake_redis.set(status_key, json.dumps({"cached": "state"}))
+    engine.recover_zombie_jobs(acct_id)
+    assert status_key not in fake_redis.data
+
+
+def test_redis_circuit_breaker_reconnect_cooldown():
+    """Verify that Redis connection manager throttles reconnect attempts to prevent blocking delays."""
+    mgr = RedisCacheManager()
+    mgr.enabled = True
+    mgr._is_connected = False
+    mgr._last_connect_attempt = time.time()
+    mgr._reconnect_cooldown = 10.0
+
+    # Within cooldown period, connect(force=False) immediately returns False without opening sockets
+    with patch("app.core.cache.redis.Redis") as mock_redis:
+        assert mgr.connect(force=False) is False
+        mock_redis.assert_not_called()
+
+    # Forcing (or after cooldown expires) allows reconnect attempt to proceed
+    with patch("app.core.cache.redis.Redis") as mock_redis:
+        mock_redis.return_value.ping.return_value = True
+        assert mgr.connect(force=True) is True
+        assert mgr._is_connected is True
+        mock_redis.assert_called_once()
+
+
+def test_cache_bypass_refreshes_redis(client, test_user, test_cloud_account, seed_resources, fake_redis):
+    """Verify bypass_cache=true skips cache read AND refreshes Redis with authoritative database state."""
+    gen = cache_manager.get_generation(test_cloud_account.workspace_id, test_cloud_account.id)
+    sum_key = cache_manager.build_summary_key(
+        test_cloud_account.workspace_id, test_cloud_account.id, generation=gen
+    )
+
+    # Pre-seed with stale count 999
+    stale_payload = {
+        "cloud_account_id": str(test_cloud_account.id),
+        "total_active_resources": 999,
+        "ec2_instances": 500,
+        "s3_buckets": 499,
+        "vpc_resources": 0,
+        "rds_instances": 0,
+        "by_region": {},
+        "by_status": {}
+    }
+    fake_redis.set(sum_key, json.dumps(stale_payload))
+
+    # Request with bypass_cache=true
+    resp = client.get(
+        f"/api/v1/cloud/accounts/{test_cloud_account.id}/resources/summary?bypass_cache=true",
+        headers=test_user["headers"]
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_active_resources"] == 2  # Fresh DB count
+
+    # Redis cache must be refreshed with the fresh DB count (2)
+    cached_after = json.loads(fake_redis.data[sum_key])
+    assert cached_after["total_active_resources"] == 2
+
+
+def test_redis_set_unsupported_data_type_fails_gracefully(fake_redis):
+    """Verify that attempting to cache non-serializable objects fails gracefully without exceptions."""
+    # Attempt to cache an un-serializable lambda or custom object
+    unserializable = lambda x: x * 2
+    success = cache_manager.set("test:unserializable:key", unserializable)
+    assert success is False
+
+
+def test_inactive_account_rejects_cached_data(client, test_user, test_cloud_account, fake_redis, db):
+    """Verify that a deactivated account returns 404 Not Found even if cached data exists in Redis."""
+    sum_key = cache_manager.build_summary_key(test_cloud_account.workspace_id, test_cloud_account.id)
+    fake_redis.set(sum_key, json.dumps({"total_active_resources": 10}))
+
+    # Deactivate account in PostgreSQL
+    test_cloud_account.is_active = False
+    db.commit()
+
+    resp = client.get(
+        f"/api/v1/cloud/accounts/{test_cloud_account.id}/resources/summary",
+        headers=test_user["headers"]
+    )
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()

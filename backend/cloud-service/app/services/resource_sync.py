@@ -146,6 +146,14 @@ class ResourceSyncEngine:
         self.db.add(job)
         self.db.commit()
         self.db.refresh(job)
+
+        # Invalidate sync status cache so clients immediately see the new PENDING job
+        try:
+            from app.core.cache import cache_manager
+            cache_manager.invalidate_sync_status(workspace_id, cloud_account_id)
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate sync status on job create: {exc}")
+
         return job
 
     def sync_account(
@@ -196,6 +204,13 @@ class ResourceSyncEngine:
             logger.warning(
                 f"Recovered {recovered_count} zombie sync jobs for cloud account {cloud_account_id}."
             )
+            # Invalidate sync status cache for recovered accounts
+            try:
+                from app.core.cache import cache_manager
+                for j in stale_jobs:
+                    cache_manager.invalidate_sync_status(j.workspace_id, j.cloud_account_id)
+            except Exception as exc:
+                logger.warning(f"Failed to invalidate sync status after zombie recovery: {exc}")
 
         return recovered_count
 
@@ -255,6 +270,13 @@ class ResourceSyncEngine:
         job.started_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(job)
+
+        # Invalidate sync status cache so clients immediately see the RUNNING job
+        try:
+            from app.core.cache import cache_manager
+            cache_manager.invalidate_sync_status(job.workspace_id, job.cloud_account_id)
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate sync status on job start: {exc}")
 
         account = self.db.query(CloudAccount).filter(CloudAccount.id == job.cloud_account_id).first()
         if not account:
@@ -555,16 +577,17 @@ class ResourceSyncEngine:
         self.db.commit()
         self.db.refresh(job)
 
-        # Invalidate cached resources and summaries strictly for this account and workspace
-        if successful_scopes > 0:
-            try:
-                from app.core.cache import cache_manager
+        # Invalidate sync status always, and invalidate resource cache if scopes were updated
+        try:
+            from app.core.cache import cache_manager
+            cache_manager.invalidate_sync_status(account.workspace_id, account.id)
+            if successful_scopes > 0:
                 cache_manager.invalidate_account_cache(account.workspace_id, account.id)
-            except Exception as cache_exc:
-                logger.warning(
-                    f"Cache invalidation failed for account {account.id} after sync: {cache_exc}. "
-                    "Database synchronization remains safely committed."
-                )
+        except Exception as cache_exc:
+            logger.warning(
+                f"Cache invalidation failed for account {account.id} after sync: {cache_exc}. "
+                "Database synchronization remains safely committed."
+            )
 
         return job
 
@@ -696,6 +719,14 @@ class ResourceSyncEngine:
         }]
         self.db.commit()
         self.db.refresh(job)
+
+        # Invalidate sync status cache so clients immediately see the FAILED job
+        try:
+            from app.core.cache import cache_manager
+            cache_manager.invalidate_sync_status(job.workspace_id, job.cloud_account_id)
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate sync status on job failure: {exc}")
+
         return job
 
     @staticmethod
