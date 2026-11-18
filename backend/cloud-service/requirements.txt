@@ -12,3 +12,4 @@ email-validator
 python-dotenv
 redis
 httpx
+boto3

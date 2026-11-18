@@ -4,6 +4,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.database import init_db
+from app.core.cache import cache_manager
 from app.api.cloud_accounts import router as cloud_accounts_router
 
 init_db()
@@ -30,6 +31,16 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def on_startup():
+    cache_manager.connect()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    cache_manager.close()
+
+
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
@@ -40,7 +51,8 @@ def health_check():
     return {
         "status": "healthy",
         "service": "cloud-service",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "redis": "connected" if cache_manager.ping() else "unavailable"
     }
 
 

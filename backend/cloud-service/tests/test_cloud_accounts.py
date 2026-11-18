@@ -1,4 +1,6 @@
 import uuid
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch, MagicMock
 import pytest
 from sqlalchemy import text
 from app.core.security import decrypt_credential
@@ -323,9 +325,29 @@ def test_aws_provider_account_id_extraction():
     assert info["provider"] == "aws"
 
 
-def test_aws_provider_safe_credential_validation():
-    """Verify credentials validation runs safely without crashing when offline."""
+@patch("boto3.client")
+def test_aws_provider_safe_credential_validation(mock_boto_client):
+    """Verify credentials validation performs STS AssumeRole and caller identity verification."""
+    mock_sts = MagicMock()
+    mock_boto_client.return_value = mock_sts
+    mock_sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "AQoDYXdzEJr1EXAMPLE==",
+            "Expiration": datetime.now(timezone.utc) + timedelta(seconds=1800)
+        }
+    }
+    mock_sts.get_caller_identity.return_value = {
+        "Account": "123456789012",
+        "Arn": "arn:aws:sts::123456789012:assumed-role/SafeValidationRole/CloudPilot-Session",
+        "UserId": "AROAEXAMPLE:CloudPilot-Session"
+    }
+
     valid_arn = "arn:aws:iam::123456789012:role/SafeValidationRole"
-    provider = AWSProvider(role_arn=valid_arn, region="us-east-1")
-    # Returns True via graceful fallback / offline structure check
+    provider = AWSProvider(
+        role_arn=valid_arn,
+        external_id="ext-safe-validation-123",
+        region="us-east-1"
+    )
     assert provider.validate_credentials() is True

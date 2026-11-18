@@ -1,15 +1,37 @@
+import logging
 import uuid
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Any
 
-from fastapi import HTTPException, status
-from sqlalchemy import Column, Integer, String, Boolean
+from fastapi import BackgroundTasks, HTTPException, status
+from sqlalchemy import Column, Integer, String, Boolean, or_, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Session, declarative_base
 
 from app.models.cloud_account import CloudAccount
+from app.models.cloud_resource import (
+    CloudResource,
+    CloudSyncJob,
+    SyncStatus,
+    SyncType,
+    ResourceType,
+)
 from app.schemas.cloud_account import CloudAccountCreate, CloudAccountUpdate
+from app.schemas.cloud_resource import (
+    CloudAccountVerifyResponse,
+    SyncTriggerResponse,
+    SyncStatusResponse,
+    ResourceSummaryResponse,
+    CloudResourceResponse,
+)
 from app.core.security import encrypt_credential, decrypt_credential
+from app.core.database import SessionLocal
+from app.core.cache import cache_manager
+from app.core.config import CACHE_TTL_SUMMARY, CACHE_TTL_LIST
 from app.providers.aws import AWSProvider
+from app.providers.aws.session import AWSSessionManager, AWSSessionError
+from app.services.resource_sync import ResourceSyncEngine, AsyncSyncRunner, ConcurrentSyncError
+
+logger = logging.getLogger(__name__)
 
 # ── RBAC configuration ──────────────────────────────────────────────────────
 WRITE_ROLES = {"owner", "admin"}
@@ -228,6 +250,13 @@ def update_cloud_account(
 
     db.commit()
     db.refresh(account)
+
+    # Invalidate cache on account update (scoped to workspace and account)
+    try:
+        cache_manager.invalidate_account_cache(account.workspace_id, account.id)
+    except Exception as exc:
+        logger.warning(f"Cache invalidation failed after account update: {exc}")
+
     return account
 
 
@@ -252,3 +281,443 @@ def delete_cloud_account(
 
     account.is_active = False
     db.commit()
+
+    # Invalidate cache for deactivated account
+    try:
+        cache_manager.invalidate_account_cache(account.workspace_id, account.id)
+    except Exception as exc:
+        logger.warning(f"Cache invalidation failed after account deactivation: {exc}")
+
+
+# ==============================================================================
+# PHASE 3B.5: DISCOVERY & SYNCHRONIZATION SERVICE FUNCTIONS
+# ==============================================================================
+
+# ── 1. AWS Connection Verification ──────────────────────────────────────────
+
+def verify_cloud_account_connection(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID
+) -> CloudAccountVerifyResponse:
+    """
+    Validates AWS cross-account AssumeRole connectivity and identity verification.
+    Requires Owner or Admin role in the workspace.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=True)
+
+    if not account.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot verify an inactive cloud account"
+        )
+
+    if account.provider.lower() != "aws":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Provider '{account.provider}' does not support AWS verification"
+        )
+
+    try:
+        session_mgr = AWSSessionManager.from_cloud_account(account)
+        identity = session_mgr.assume_role()
+
+        # Update account operational status to active on verified connection
+        if account.status in ("pending", "error"):
+            account.status = "active"
+            db.commit()
+            db.refresh(account)
+
+        return CloudAccountVerifyResponse(
+            status="verified",
+            provider="aws",
+            account_id=str(identity.get("account_id", "")),
+            assumed_role_arn=str(identity.get("assumed_role_arn", "")),
+            user_id=identity.get("user_id"),
+            verified_at=identity.get("verified_at")
+        )
+    except AWSSessionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"AWS connection verification failed: {exc.message}"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"AWS connection verification failed: {str(exc)}"
+        )
+
+
+# ── 2. Synchronization Execution ─────────────────────────────────────────────
+
+def trigger_account_sync(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    sync_type: str,
+    background_tasks: BackgroundTasks,
+    regions: Optional[List[str]] = None
+) -> SyncTriggerResponse:
+    """
+    Creates and enqueues a CloudSyncJob for execution.
+    Requires Owner or Admin role in the workspace.
+    Returns HTTP 202 Accepted contract.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=True)
+
+    if not account.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot synchronize an inactive cloud account"
+        )
+
+    st_val = sync_type.lower().strip()
+    valid_sync_types = {e.value for e in SyncType}
+    if st_val not in valid_sync_types:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid sync_type '{sync_type}'. Must be one of: {', '.join(sorted(valid_sync_types))}"
+        )
+
+    engine = ResourceSyncEngine(db)
+
+    # Clean up any zombie jobs older than timeout limit
+    engine.recover_zombie_jobs(account.id)
+
+    # Check for active running synchronization to prevent state corruption
+    active_job = db.query(CloudSyncJob).filter(
+        CloudSyncJob.cloud_account_id == account.id,
+        CloudSyncJob.status == SyncStatus.RUNNING.value
+    ).first()
+
+    if active_job:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A synchronization job ({active_job.id}) is already running for this cloud account."
+        )
+
+    # Create the CloudSyncJob in PENDING state
+    job = engine.create_sync_job(
+        cloud_account_id=account.id,
+        workspace_id=account.workspace_id,
+        sync_type=st_val,
+        triggered_by_user_id=current_user_id
+    )
+
+    # Dispatch to background task runner using isolated session factory
+    background_tasks.add_task(
+        AsyncSyncRunner.run_sync_job,
+        db_session_factory=SessionLocal,
+        job_id=job.id,
+        regions=regions
+    )
+
+    return SyncTriggerResponse(
+        job_id=job.id,
+        cloud_account_id=account.id,
+        status=job.status,
+        sync_type=job.sync_type,
+        message="Synchronization job accepted and queued for background execution",
+        created_at=job.created_at
+    )
+
+
+# ── 3. Sync Status and Job Tracking ──────────────────────────────────────────
+
+def get_sync_status(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID
+) -> SyncStatusResponse:
+    """
+    Returns the latest synchronization status for a cloud account.
+    Readable by all workspace members (Owner, Admin, Developer, Viewer).
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    engine = ResourceSyncEngine(db)
+    engine.recover_zombie_jobs(account.id)
+
+    active_job = db.query(CloudSyncJob).filter(
+        CloudSyncJob.cloud_account_id == account.id,
+        CloudSyncJob.status == SyncStatus.RUNNING.value
+    ).first()
+
+    latest_job = db.query(CloudSyncJob).filter(
+        CloudSyncJob.cloud_account_id == account.id
+    ).order_by(CloudSyncJob.started_at.desc()).first()
+
+    return SyncStatusResponse(
+        cloud_account_id=account.id,
+        has_active_job=bool(active_job),
+        active_job=active_job,
+        latest_job=latest_job
+    )
+
+
+def list_sync_jobs(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    page: int = 1,
+    limit: int = 10,
+    status_filter: Optional[str] = None
+) -> Tuple[List[CloudSyncJob], int]:
+    """
+    Paginated list of synchronization jobs for a cloud account.
+    Readable by all workspace members.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    query = db.query(CloudSyncJob).filter(
+        CloudSyncJob.cloud_account_id == account.id
+    )
+
+    if status_filter:
+        query = query.filter(CloudSyncJob.status == status_filter.lower().strip())
+
+    total = query.count()
+    offset = (page - 1) * limit
+    items = query.order_by(CloudSyncJob.started_at.desc()).offset(offset).limit(limit).all()
+    return items, total
+
+
+def get_sync_job(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    job_id: uuid.UUID
+) -> CloudSyncJob:
+    """
+    Retrieve specific sync job details by UUID.
+    Readable by all workspace members.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    job = db.query(CloudSyncJob).filter(
+        CloudSyncJob.id == job_id,
+        CloudSyncJob.cloud_account_id == account.id
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Sync job not found"
+        )
+    return job
+
+
+# ── 4. Resource Queries & Aggregations ───────────────────────────────────────
+
+def list_resources(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    page: int = 1,
+    limit: int = 20,
+    resource_type: Optional[str] = None,
+    region: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    search: Optional[str] = None,
+    include_deleted: bool = False,
+    bypass_cache: bool = False
+) -> Tuple[List[Any], int]:
+    """
+    Database-side filtered and paginated resource listing with Redis caching.
+    Readable by all workspace members.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    cache_params = {
+        "page": page,
+        "limit": limit,
+        "resource_type": resource_type,
+        "region": region,
+        "status": status_filter,
+        "search": search,
+        "include_deleted": include_deleted,
+    }
+    cache_key = cache_manager.build_list_key(account.workspace_id, account.id, cache_params)
+
+    # 1. Check cache (unless explicitly bypassed)
+    if not bypass_cache:
+        cached_data = cache_manager.get(cache_key)
+        if cached_data and isinstance(cached_data, dict) and "items" in cached_data and "total" in cached_data:
+            try:
+                cached_items = [CloudResourceResponse.model_validate(item) for item in cached_data["items"]]
+                return cached_items, int(cached_data["total"])
+            except Exception as exc:
+                logger.warning(f"Malformed list cache for key '{cache_key}': {exc}. Refetching from database.")
+
+    # 2. Query PostgreSQL (Source of Truth)
+    query = db.query(CloudResource).filter(
+        CloudResource.cloud_account_id == account.id
+    )
+
+    if not include_deleted:
+        query = query.filter(CloudResource.is_deleted == False)
+
+    if resource_type:
+        query = query.filter(CloudResource.resource_type == resource_type.lower().strip())
+
+    if region:
+        query = query.filter(CloudResource.region == region.lower().strip())
+
+    if status_filter:
+        query = query.filter(CloudResource.status == status_filter.lower().strip())
+
+    if search:
+        term = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                CloudResource.name.ilike(term),
+                CloudResource.provider_resource_id.ilike(term)
+            )
+        )
+
+    total = query.count()
+    offset = (page - 1) * limit
+    items = query.order_by(CloudResource.created_at.desc()).offset(offset).limit(limit).all()
+
+    # 3. Populate Redis Cache
+    try:
+        serialized_items = [CloudResourceResponse.model_validate(item).model_dump() for item in items]
+        cache_manager.set(
+            cache_key,
+            {"items": serialized_items, "total": total},
+            ttl=CACHE_TTL_LIST
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to cache resource listing for key '{cache_key}': {exc}")
+
+    return items, total
+
+
+def get_resource(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    resource_id: uuid.UUID,
+    include_deleted: bool = False
+) -> CloudResource:
+    """
+    Retrieve specific cloud resource by UUID.
+    Readable by all workspace members.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    query = db.query(CloudResource).filter(
+        CloudResource.id == resource_id,
+        CloudResource.cloud_account_id == account.id
+    )
+
+    if not include_deleted:
+        query = query.filter(CloudResource.is_deleted == False)
+
+    res = query.first()
+    if not res:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found"
+        )
+    return res
+
+
+def get_resource_summary(
+    db: Session,
+    current_user_id: int,
+    account_id: uuid.UUID,
+    include_deleted: bool = False,
+    bypass_cache: bool = False
+) -> ResourceSummaryResponse:
+    """
+    Calculates database-side aggregate resource statistics for an account with Redis caching.
+    Readable by all workspace members.
+    """
+    account = get_cloud_account(db, current_user_id, account_id)
+    _require_workspace_access(db, account.workspace_id, current_user_id, require_write=False)
+
+    cache_key = cache_manager.build_summary_key(account.workspace_id, account.id, include_deleted=include_deleted)
+
+    # 1. Check cache (unless explicitly bypassed)
+    if not bypass_cache:
+        cached_data = cache_manager.get(cache_key)
+        if cached_data and isinstance(cached_data, dict):
+            try:
+                return ResourceSummaryResponse.model_validate(cached_data)
+            except Exception as exc:
+                logger.warning(f"Malformed summary cache for key '{cache_key}': {exc}. Refetching from database.")
+
+    # 2. Query PostgreSQL (Source of Truth)
+    filters = [CloudResource.cloud_account_id == account.id]
+    if not include_deleted:
+        filters.append(CloudResource.is_deleted == False)
+
+    total_active = db.query(func.count(CloudResource.id)).filter(*filters).scalar() or 0
+
+    ec2_count = db.query(func.count(CloudResource.id)).filter(
+        *filters, CloudResource.resource_type == ResourceType.EC2_INSTANCE.value
+    ).scalar() or 0
+
+    s3_count = db.query(func.count(CloudResource.id)).filter(
+        *filters, CloudResource.resource_type == ResourceType.S3_BUCKET.value
+    ).scalar() or 0
+
+    vpc_types = [
+        ResourceType.VPC.value,
+        ResourceType.SUBNET.value,
+        ResourceType.SECURITY_GROUP.value,
+        ResourceType.ROUTE_TABLE.value,
+        ResourceType.INTERNET_GATEWAY.value,
+        ResourceType.NAT_GATEWAY.value,
+    ]
+    vpc_count = db.query(func.count(CloudResource.id)).filter(
+        *filters, CloudResource.resource_type.in_(vpc_types)
+    ).scalar() or 0
+
+    rds_types = [
+        ResourceType.RDS_INSTANCE.value,
+        ResourceType.RDS_CLUSTER.value,
+    ]
+    rds_count = db.query(func.count(CloudResource.id)).filter(
+        *filters, CloudResource.resource_type.in_(rds_types)
+    ).scalar() or 0
+
+    # Aggregate by region
+    region_rows = db.query(
+        CloudResource.region, func.count(CloudResource.id)
+    ).filter(*filters).group_by(CloudResource.region).all()
+    by_region = {row[0]: row[1] for row in region_rows if row[0]}
+
+    # Aggregate by operational status
+    status_rows = db.query(
+        CloudResource.status, func.count(CloudResource.id)
+    ).filter(*filters).group_by(CloudResource.status).all()
+    by_status = {row[0]: row[1] for row in status_rows if row[0]}
+
+    summary = ResourceSummaryResponse(
+        cloud_account_id=account.id,
+        total_active_resources=total_active,
+        ec2_instances=ec2_count,
+        s3_buckets=s3_count,
+        vpc_resources=vpc_count,
+        rds_instances=rds_count,
+        by_region=by_region,
+        by_status=by_status
+    )
+
+    # 3. Populate Redis Cache
+    try:
+        cache_manager.set(cache_key, summary.model_dump(), ttl=CACHE_TTL_SUMMARY)
+    except Exception as exc:
+        logger.warning(f"Failed to cache resource summary for key '{cache_key}': {exc}")
+
+    return summary
+

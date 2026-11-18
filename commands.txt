@@ -39,7 +39,7 @@ docker compose stop
 docker compose down
 
 -------------------------------------------------------------------------------
-4. AUTOMATED REGRESSION TESTING (PHASE 4A)
+4. AUTOMATED REGRESSION TESTING (PHASE 4A, 3B.1, 3B.2, 3B.3, 3B.4, 3B.5 & 3B.6)
 -------------------------------------------------------------------------------
 # Target isolated test database (zero impact on CloudPilot dev db):
 # TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/cloudpilot_test
@@ -50,8 +50,30 @@ python run_tests.py
 # Run Auth & Workspace Service tests only:
 pytest backend/auth-service/tests -v
 
-# Run Cloud Service tests only:
+# Run Cloud Service tests only (includes accounts, STS, DB models, discovery, sync, REST APIs, and Redis):
 pytest backend/cloud-service/tests -v
+
+# Run AWS STS AssumeRole tests specifically (Phase 3B.1):
+pytest backend/cloud-service/tests/test_aws_session.py -v
+
+# Run Cloud Database Models & Architecture tests specifically (Phase 3B.2):
+pytest backend/cloud-service/tests/test_cloud_database_models.py -v
+
+# Run AWS Resource Discovery & Normalizer tests specifically (Phase 3B.3):
+pytest backend/cloud-service/tests/test_aws_normalizer.py -v
+pytest backend/cloud-service/tests/test_aws_ec2_discovery.py -v
+pytest backend/cloud-service/tests/test_aws_s3_discovery.py -v
+pytest backend/cloud-service/tests/test_aws_vpc_discovery.py -v
+pytest backend/cloud-service/tests/test_aws_rds_discovery.py -v
+
+# Run Resource Synchronization Engine & Safe Reconciliation tests (Phase 3B.4):
+pytest backend/cloud-service/tests/test_resource_sync.py -v
+
+# Run Phase 3B.5 REST API Integration tests specifically:
+pytest backend/cloud-service/tests/test_cloud_api.py -v
+
+# Run Redis Caching & Invalidation tests specifically (Phase 3B.6):
+pytest backend/cloud-service/tests/test_redis_cache.py -v
 
 # Measure coverage for Auth Service:
 pytest backend/auth-service/tests --cov=app --cov-report=term-missing
@@ -59,15 +81,114 @@ pytest backend/auth-service/tests --cov=app --cov-report=term-missing
 # Measure coverage for Cloud Service:
 pytest backend/cloud-service/tests --cov=app --cov-report=term-missing
 
-# Manual Acceptance Checklist:
-# Refer to: backend/tests/manual_acceptance_checklist.md
+-------------------------------------------------------------------------------
+5. AWS STS ASSUMEROLE INTEGRATION (PHASE 3B.1)
+-------------------------------------------------------------------------------
+# Purpose: Ephemeral cross-account STS AssumeRole with CallerIdentity validation.
+# No temporary credentials (AccessKeyId, SecretAccessKey, SessionToken) are ever
+# stored in PostgreSQL or Redis. All temporary credentials exist in memory only.
 
-# Health check endpoints:
-curl http://localhost:8000/docs
-curl http://localhost:8001/health
+# Manual Real AWS Connection Verification (Optional — requires active AWS credentials):
+$env:AWS_ACCESS_KEY_ID="<your-cloudpilot-host-key>"
+$env:AWS_SECRET_ACCESS_KEY="<your-cloudpilot-host-secret>"
+$env:AWS_DEFAULT_REGION="us-east-1"
+
+# Run standalone verification script against customer role:
+py -c "
+from app.providers.aws import AWSProvider
+provider = AWSProvider(
+    role_arn='arn:aws:iam::<TARGET_ACCOUNT_ID>:role/<ROLE_NAME>',
+    external_id='<EXTERNAL_ID>',
+    account_id='<TARGET_ACCOUNT_ID>',
+    region='us-east-1'
+)
+print('Format valid:', provider.validate_role_arn_format())
+identity = provider.verify_connection()
+print('Verified Identity:', identity)
+"
 
 -------------------------------------------------------------------------------
-5. INTERACTIVE PORTALS & DOCUMENTATION URLS
+6. AWS RESOURCE DISCOVERY MODULES (PHASE 3B.3)
+-------------------------------------------------------------------------------
+# Purpose: Normalized read-only discovery of EC2, S3, VPC, and RDS resources
+# using assumed-role boto3 sessions. All raw responses are sanitized into
+# schema-compliant JSON structures without storing secret keys or passwords.
+
+# Test single discovery module in isolation:
+pytest backend/cloud-service/tests/test_aws_ec2_discovery.py -k "test_discover_instances_single_page" -v
+pytest backend/cloud-service/tests/test_aws_s3_discovery.py -k "test_discover_buckets_basic" -v
+pytest backend/cloud-service/tests/test_aws_vpc_discovery.py -k "test_discover_vpcs_with_subnets" -v
+pytest backend/cloud-service/tests/test_aws_rds_discovery.py -k "test_discover_rds_instances_basic" -v
+
+-------------------------------------------------------------------------------
+7. RESOURCE SYNCHRONIZATION ENGINE & RECONCILIATION (PHASE 3B.4)
+-------------------------------------------------------------------------------
+# Purpose: Orchestrates multi-service AWS discovery, manages job lifecycles
+# (PENDING -> RUNNING -> COMPLETED / PARTIAL_FAILURE / FAILED), performs bulk
+# PostgreSQL upserts, and safely reconciles stale resources only within
+# verified, successful discovery scopes (zero deletions on failed scopes).
+
+# Run all synchronization engine tests:
+pytest backend/cloud-service/tests/test_resource_sync.py -v
+
+# Run targeted reconciliation and concurrency tests:
+pytest backend/cloud-service/tests/test_resource_sync.py -k "test_successful_stale_resource_reconciliation" -v
+pytest backend/cloud-service/tests/test_resource_sync.py -k "test_failed_discovery_preserves_existing_resources" -v
+pytest backend/cloud-service/tests/test_resource_sync.py -k "test_concurrent_sync_protection" -v
+pytest backend/cloud-service/tests/test_resource_sync.py -k "test_stale_job_recovery" -v
+
+-------------------------------------------------------------------------------
+8. DISCOVERY & SYNCHRONIZATION REST API ENDPOINTS (PHASE 3B.5)
+-------------------------------------------------------------------------------
+# Purpose: Secured REST API endpoints for verifying AWS STS connectivity,
+# triggering background synchronization, inspecting job progress, and querying
+# discovered resources with database-side filtering and aggregation.
+
+# AWS Connection Verification (Requires Owner/Admin):
+# POST /api/v1/cloud/accounts/{account_id}/verify
+
+# Resource Synchronization (Requires Owner/Admin):
+# POST /api/v1/cloud/accounts/{account_id}/sync
+# Payload: {"sync_type": "full"}  (supports "full", "ec2", "s3", "vpc", "rds")
+
+# Sync Status & Historical Job Tracking (All Workspace Members):
+# GET /api/v1/cloud/accounts/{account_id}/sync/status
+# GET /api/v1/cloud/accounts/{account_id}/sync/jobs?page=1&limit=10&status=completed
+# GET /api/v1/cloud/accounts/{account_id}/sync/jobs/{job_id}
+
+# Discovered Resources & Summaries (All Workspace Members):
+# Supports ?bypass_cache=true to force database re-query
+# GET /api/v1/cloud/accounts/{account_id}/resources?page=1&limit=20&resource_type=ec2_instance&bypass_cache=false
+# GET /api/v1/cloud/accounts/{account_id}/resources/{resource_id}
+# GET /api/v1/cloud/accounts/{account_id}/resources/summary?bypass_cache=false
+
+-------------------------------------------------------------------------------
+9. REDIS CACHING & CACHE INVALIDATION ARCHITECTURE (PHASE 3B.6)
+-------------------------------------------------------------------------------
+# Purpose: High-performance, fail-safe Redis caching for cloud resource summaries
+# and listings with deterministic SHA-256 query hashing, strict workspace/account
+# tenant isolation, post-commit cache eviction, and 100% graceful fallback to PostgreSQL.
+#
+# Key Features:
+# - Connection pooling with connect/socket timeouts (2.0s) & max pool size (20)
+# - Bounded TTLs: Summary (300s), Resource Listings (120s), Sync Status (30s)
+# - Strict multi-tenant isolation: Keys partitioned by workspace_id and account_id
+# - Versioned namespace: cloudpilot:v1:*
+# - Fail-open resilience: Redis failures log warnings; APIs seamlessly fall back to DB
+# - Security guarantee: Zero IAM Role ARNs, External IDs, or STS tokens in Redis
+# - Authorization verified in PostgreSQL before any cache lookup
+#
+# Inspect Redis Cache Keys in Docker Container:
+# docker compose exec redis redis-cli KEYS "cloudpilot:v1:*"
+#
+# Inspect Redis TTL for a cached key:
+# docker compose exec redis redis-cli TTL "cloudpilot:v1:resources:summary:<ws_id>:<account_id>:0"
+#
+# Manually flush Redis test keys:
+# docker compose exec redis redis-cli --scan --pattern "cloudpilot:v1:*" | xargs -r docker compose exec -T redis redis-cli DEL
+
+-------------------------------------------------------------------------------
+10. INTERACTIVE PORTALS & DOCUMENTATION URLS
 -------------------------------------------------------------------------------
 # Auth Service Swagger API Docs:
 http://localhost:8000/docs

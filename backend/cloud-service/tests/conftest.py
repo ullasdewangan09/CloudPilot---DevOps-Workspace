@@ -35,7 +35,7 @@ from datetime import datetime, timezone, timedelta
 from jose import jwt
 
 from app.main import app
-from app.core.database import get_db
+from app.core.database import get_db, init_db
 from app.core.config import JWT_SECRET, JWT_ALGORITHM
 
 def create_test_token(data: dict) -> str:
@@ -53,19 +53,31 @@ with test_engine.connect() as conn:
             "Must be 'cloudpilot_test'. Aborting all test operations."
         )
 
+# Initialize all cloud service tables (cloud_accounts, cloud_resources, cloud_sync_jobs) in isolated test DB
+init_db(target_engine=test_engine)
+
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
 
 @pytest.fixture(autouse=True)
 def clean_database():
-    """Ensure cloud_accounts and reference tables are cleaned up between tests in cloudpilot_test."""
+    """Ensure cloud_sync_jobs, cloud_resources, cloud_accounts and reference tables are cleaned up between tests in cloudpilot_test."""
     yield
     with test_engine.connect() as conn:
         assert conn.execute(text("SELECT current_database();")).scalar() == "cloudpilot_test"
         conn.execute(text("""
-            TRUNCATE TABLE cloud_accounts, workspace_audit_logs, workspace_members, workspaces, users RESTART IDENTITY CASCADE;
+            TRUNCATE TABLE cloud_sync_jobs, cloud_resources, cloud_accounts, workspace_audit_logs, workspace_members, workspaces, users RESTART IDENTITY CASCADE;
         """))
         conn.commit()
+    # Clean up Redis test keys if Redis is available
+    try:
+        from app.core.cache import cache_manager
+        if cache_manager.client:
+            keys = list(cache_manager.client.scan_iter("cloudpilot:v1:*"))
+            if keys:
+                cache_manager.client.delete(*keys)
+    except Exception:
+        pass
 
 
 @pytest.fixture

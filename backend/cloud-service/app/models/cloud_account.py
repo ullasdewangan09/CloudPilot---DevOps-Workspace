@@ -3,6 +3,7 @@ from sqlalchemy import (
     Column, DateTime, ForeignKey, Integer, String, Text, Boolean, Enum
 )
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
 
@@ -114,4 +115,19 @@ class CloudAccount(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now()
+    )
+
+    # Child relationships (cascade delete when cloud account is removed)
+    resources = relationship(
+        "CloudResource",
+        back_populates="account",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
+
+    sync_jobs = relationship(
+        "CloudSyncJob",
+        back_populates="account",
+        cascade="all, delete-orphan",
+        passive_deletes=True
     )
