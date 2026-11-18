@@ -62,3 +62,25 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+
+  cloud-sync-worker:
+    build: ./backend/cloud-service
+    command: ["python", "-m", "app.workers.sync_worker"]
+    restart: unless-stopped
+    env_file:
+      - ./backend/cloud-service/.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@host.docker.internal:5432/CloudPilot}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-cloudpilot_secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      FERNET_KEY: ${FERNET_KEY:-9AHRW3AtKGsdZ6BIELRR4NjPRHFjOfRggwI9Tu0T9zI=}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-2.0}
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-15.0}
+      WORKER_JOB_LEASE_SECONDS: ${WORKER_JOB_LEASE_SECONDS:-120}
+      WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy

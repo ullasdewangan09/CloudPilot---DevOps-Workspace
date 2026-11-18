@@ -26,7 +26,7 @@ from app.schemas.cloud_resource import (
 from app.core.security import encrypt_credential, decrypt_credential
 from app.core.database import SessionLocal
 from app.core.cache import cache_manager
-from app.core.config import CACHE_TTL_SUMMARY, CACHE_TTL_LIST, CACHE_TTL_SYNC_STATUS
+from app.core.config import CACHE_TTL_SUMMARY, CACHE_TTL_LIST, CACHE_TTL_SYNC_STATUS, SYNC_EXECUTION_MODE
 from app.providers.aws import AWSProvider
 from app.providers.aws.session import AWSSessionManager, AWSSessionError
 from app.services.resource_sync import ResourceSyncEngine, AsyncSyncRunner, ConcurrentSyncError
@@ -406,13 +406,15 @@ def trigger_account_sync(
         triggered_by_user_id=current_user_id
     )
 
-    # Dispatch to background task runner using isolated session factory
-    background_tasks.add_task(
-        AsyncSyncRunner.run_sync_job,
-        db_session_factory=SessionLocal,
-        job_id=job.id,
-        regions=regions
-    )
+    # For durable architecture (Phase 3B.7), jobs are persisted as PENDING in PostgreSQL
+    # and claimed by independent workers. In-process execution is only used if configured.
+    if SYNC_EXECUTION_MODE == "background_tasks" and background_tasks is not None:
+        background_tasks.add_task(
+            AsyncSyncRunner.run_sync_job,
+            db_session_factory=SessionLocal,
+            job_id=job.id,
+            regions=regions
+        )
 
     return SyncTriggerResponse(
         job_id=job.id,

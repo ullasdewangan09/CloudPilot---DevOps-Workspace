@@ -24,6 +24,7 @@ from sqlalchemy import select, update, func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.core.config import WORKER_MAX_ATTEMPTS
 from app.models.cloud_account import CloudAccount
 from app.models.cloud_resource import (
     CloudResource,
@@ -72,6 +73,30 @@ class CloudAccountNotFoundError(SyncEngineError):
 class SyncJobNotFoundError(SyncEngineError):
     """Raised when the specified sync job does not exist."""
     pass
+
+
+class RecoverableSyncError(SyncEngineError):
+    """Raised when sync fails due to transient network, throttling, or connection errors."""
+    pass
+
+
+def is_recoverable_error(exc: Exception) -> bool:
+    """
+    Classifies whether an exception is transient/recoverable
+    (network glitches, timeouts, throttling, rate limits, transient DB errors)
+    vs permanent configuration errors (invalid role ARN, AccessDenied, auth errors).
+    """
+    if isinstance(exc, (AWSConnectionError, AWSThrottlingError)):
+        return True
+    msg = str(exc).lower()
+    transient_patterns = [
+        "throttling", "requestlimitexceeded", "rate exceeded",
+        "timeout", "timed out", "connection reset", "connection refused",
+        "endpointconnectionerror", "connecttimeouterror", "readtimeouterror",
+        "serviceunavailable", "internalservererror", "503", "504", "500",
+        "deadlock detected", "could not serialize access", "operationalerror"
+    ]
+    return any(p in msg for p in transient_patterns)
 
 
 # ── Discovery Scope Data Structure ──────────────────────────────────────────
@@ -142,6 +167,11 @@ class ResourceSyncEngine:
             deleted_resources=0,
             summary={},
             errors=[],
+            attempts=0,
+            max_attempts=WORKER_MAX_ATTEMPTS,
+            worker_id=None,
+            heartbeat_at=None,
+            next_retry_at=None,
         )
         self.db.add(job)
         self.db.commit()
@@ -214,6 +244,14 @@ class ResourceSyncEngine:
 
         return recovered_count
 
+    def _heartbeat(self, job: CloudSyncJob) -> None:
+        """Pushes a heartbeat timestamp update to PostgreSQL for the active running job."""
+        try:
+            job.heartbeat_at = datetime.now(timezone.utc)
+            self.db.commit()
+        except Exception as exc:
+            logger.warning(f"Heartbeat pulse failed for job {job.id}: {exc}")
+
     # ── Concurrency & Locking ───────────────────────────────────────────────
 
     def _acquire_account_lock(self, cloud_account_id: uuid.UUID) -> bool:
@@ -253,6 +291,7 @@ class ResourceSyncEngine:
         self,
         job_id: uuid.UUID,
         regions: Optional[List[str]] = None,
+        raise_on_recoverable: bool = False,
     ) -> CloudSyncJob:
         """
         Executes synchronization for the given CloudSyncJob.
@@ -265,9 +304,12 @@ class ResourceSyncEngine:
         # Check for active running jobs and recover zombies
         self._check_active_running_job(job.cloud_account_id, job.id)
 
-        # Transition job to RUNNING
-        job.status = SyncStatus.RUNNING.value
-        job.started_at = datetime.now(timezone.utc)
+        # Transition job to RUNNING if not already transitioned (e.g. by worker atomic claim)
+        now_utc = datetime.now(timezone.utc)
+        if job.status != SyncStatus.RUNNING.value:
+            job.status = SyncStatus.RUNNING.value
+            job.started_at = now_utc
+        job.heartbeat_at = now_utc
         self.db.commit()
         self.db.refresh(job)
 
@@ -299,9 +341,12 @@ class ResourceSyncEngine:
         try:
             session_manager = AWSSessionManager.from_cloud_account(account)
             session_manager.assume_role()
+            self._heartbeat(job)
         except (AWSSessionError, Exception) as exc:
             sanitized_err = self._sanitize_error(exc)
             logger.error(f"Failed to establish AWS STS session for account {account.id}: {sanitized_err}")
+            if raise_on_recoverable and is_recoverable_error(exc):
+                raise RecoverableSyncError(sanitized_err) from exc
             return self._fail_job(job, sanitized_err, code=getattr(exc, "code", "STS_ASSUME_ROLE_FAILED"))
 
         # 2. Run discovery modules based on sync_type
@@ -314,23 +359,29 @@ class ResourceSyncEngine:
 
             if sync_type in (SyncType.FULL.value, SyncType.EC2.value):
                 scope_results.extend(self._discover_ec2(session_manager, target_regions))
+                self._heartbeat(job)
 
             if sync_type in (SyncType.FULL.value, SyncType.S3.value):
                 scope_results.extend(self._discover_s3(session_manager))
+                self._heartbeat(job)
 
             if sync_type in (SyncType.FULL.value, SyncType.VPC.value):
                 scope_results.extend(self._discover_vpc(session_manager, target_regions))
+                self._heartbeat(job)
 
             if sync_type in (SyncType.FULL.value, SyncType.RDS.value):
                 scope_results.extend(self._discover_rds(session_manager, target_regions))
+                self._heartbeat(job)
 
             # 3. Process persistence & safe reconciliation for each scope
-            return self._finalize_sync(job, account, scope_results)
+            return self._finalize_sync(job, account, scope_results, raise_on_recoverable=raise_on_recoverable)
 
         except Exception as exc:
             self.db.rollback()
             sanitized_err = self._sanitize_error(exc)
             logger.exception(f"Unexpected error during sync execution for job {job.id}: {sanitized_err}")
+            if raise_on_recoverable and is_recoverable_error(exc):
+                raise RecoverableSyncError(sanitized_err) from exc
             return self._fail_job(job, sanitized_err, code="INTERNAL_SYNC_ERROR")
 
     # ── Modular Discovery Runners ────────────────────────────────────────────
@@ -476,7 +527,8 @@ class ResourceSyncEngine:
         self,
         job: CloudSyncJob,
         account: CloudAccount,
-        scope_results: List[DiscoveryScopeResult]
+        scope_results: List[DiscoveryScopeResult],
+        raise_on_recoverable: bool = False,
     ) -> CloudSyncJob:
         """
         Executes atomic bulk upserts and safe scoped reconciliation.
@@ -554,6 +606,10 @@ class ResourceSyncEngine:
         elif successful_scopes > 0:
             final_status = SyncStatus.PARTIAL_FAILURE.value
         else:
+            # If all scopes failed and the errors are transient/recoverable, raise for worker retry
+            if raise_on_recoverable and any(is_recoverable_error(Exception(e.get("error", ""))) for e in job_errors):
+                err_text = "; ".join(e.get("error", "") for e in job_errors)
+                raise RecoverableSyncError(err_text)
             final_status = SyncStatus.FAILED.value
 
         # Update Job Record
@@ -563,6 +619,7 @@ class ResourceSyncEngine:
         job.updated_resources = total_updated
         job.deleted_resources = total_deleted
         job.completed_at = datetime.now(timezone.utc)
+        job.heartbeat_at = None
         job.errors = job_errors
         job.summary = {
             "inserted": total_inserted,
@@ -711,6 +768,7 @@ class ResourceSyncEngine:
         """Marks a job as FAILED and records sanitized error details."""
         job.status = SyncStatus.FAILED.value
         job.completed_at = datetime.now(timezone.utc)
+        job.heartbeat_at = None
         job.errors = list(job.errors or []) + [{
             "service": "orchestrator",
             "error": error_message,

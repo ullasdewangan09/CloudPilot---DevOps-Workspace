@@ -39,7 +39,7 @@ docker compose stop
 docker compose down
 
 -------------------------------------------------------------------------------
-4. AUTOMATED REGRESSION TESTING (PHASE 4A, 3B.1, 3B.2, 3B.3, 3B.4, 3B.5 & 3B.6)
+4. AUTOMATED REGRESSION TESTING (PHASE 4A, 3B.1, 3B.2, 3B.3, 3B.4, 3B.5, 3B.6 & 3B.7)
 -------------------------------------------------------------------------------
 # Target isolated test database (zero impact on CloudPilot dev db):
 # TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/cloudpilot_test
@@ -74,6 +74,9 @@ pytest backend/cloud-service/tests/test_cloud_api.py -v
 
 # Run Redis Caching & Invalidation tests specifically (Phase 3B.6):
 pytest backend/cloud-service/tests/test_redis_cache.py -v
+
+# Run Cloud Sync Worker & Durable Recovery tests specifically (Phase 3B.7):
+pytest backend/cloud-service/tests/test_sync_worker.py -v
 
 # Measure coverage for Auth Service:
 pytest backend/auth-service/tests --cov=app --cov-report=term-missing
@@ -189,7 +192,44 @@ pytest backend/cloud-service/tests/test_resource_sync.py -k "test_stale_job_reco
 # docker compose exec redis redis-cli --scan --pattern "cloudpilot:v1:*" | xargs -r docker compose exec -T redis redis-cli DEL
 
 -------------------------------------------------------------------------------
-10. INTERACTIVE PORTALS & DOCUMENTATION URLS
+10. DURABLE BACKGROUND SYNCHRONIZATION WORKER & JOB RECOVERY (PHASE 3B.7)
+-------------------------------------------------------------------------------
+# Purpose: High-reliability, independently running PostgreSQL-backed synchronization
+# worker decoupled from the FastAPI API server process. Replaces in-memory background
+# tasks with durable, multi-worker atomic job claiming, exponential backoff retries,
+# and heartbeat-driven crash recovery.
+#
+# Key Features:
+# - PostgreSQL authoritative job store with SELECT FOR UPDATE SKIP LOCKED
+# - Zero external broker requirement (No Celery/RabbitMQ/Kafka needed)
+# - Account-level concurrency lock: Prevents claiming overlapping jobs for active accounts
+# - Exponential backoff retry engine for transient network/throttling failures
+# - Heartbeat leases (120s): Automatically reclaims or fails dead worker jobs
+# - Graceful shutdown: Listens to SIGTERM/SIGINT, finishes current job, cleans up sessions
+# - Zero credential persistence: STS credentials strictly ephemeral
+#
+# Run Cloud Sync Worker standalone (Manual Python process):
+cd backend/cloud-service
+py -m app.workers.sync_worker
+
+# Run Cloud Sync Worker via Docker Compose:
+docker compose up -d cloud-sync-worker
+
+# View live worker logs:
+docker compose logs -f cloud-sync-worker
+
+# Scale worker instances in Docker Compose:
+docker compose up -d --scale cloud-sync-worker=3
+
+# Stop or restart worker container:
+docker compose restart cloud-sync-worker
+docker compose stop cloud-sync-worker
+
+# Run Phase 3B.7 tests specifically:
+pytest backend/cloud-service/tests/test_sync_worker.py -v
+
+-------------------------------------------------------------------------------
+11. INTERACTIVE PORTALS & DOCUMENTATION URLS
 -------------------------------------------------------------------------------
 # Auth Service Swagger API Docs:
 http://localhost:8000/docs

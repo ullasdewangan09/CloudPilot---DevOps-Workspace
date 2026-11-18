@@ -7,10 +7,12 @@ from app.services.resource_sync import (
     SyncJobNotFoundError,
     DiscoveryScopeResult,
 )
+from app.services.job_queue import JobQueueService
 
 __all__ = [
     "ResourceSyncEngine",
     "AsyncSyncRunner",
+    "JobQueueService",
     "SyncEngineError",
     "ConcurrentSyncError",
     "CloudAccountNotFoundError",

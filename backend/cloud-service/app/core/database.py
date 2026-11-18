@@ -136,12 +136,24 @@ def init_db(target_engine=None):
                 deleted_resources INTEGER NOT NULL DEFAULT 0,
                 summary JSONB NOT NULL DEFAULT '{}'::jsonb,
                 errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+                worker_id VARCHAR(100),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                heartbeat_at TIMESTAMPTZ,
+                next_retry_at TIMESTAMPTZ,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """))
+        # Phase 3B.7 Idempotent Migration: Add worker and retry columns if table already existed
+        conn.execute(text("ALTER TABLE cloud_sync_jobs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(100);"))
+        conn.execute(text("ALTER TABLE cloud_sync_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;"))
+        conn.execute(text("ALTER TABLE cloud_sync_jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;"))
+        conn.execute(text("ALTER TABLE cloud_sync_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;"))
+        conn.execute(text("ALTER TABLE cloud_sync_jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;"))
+
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS ix_cloud_sync_jobs_workspace_id
             ON cloud_sync_jobs (workspace_id);
@@ -153,4 +165,14 @@ def init_db(target_engine=None):
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS ix_cloud_sync_jobs_status
             ON cloud_sync_jobs (status);
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_cloud_sync_jobs_pending_claim
+            ON cloud_sync_jobs (status, next_retry_at)
+            WHERE status = 'pending';
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_cloud_sync_jobs_running_heartbeat
+            ON cloud_sync_jobs (status, heartbeat_at)
+            WHERE status = 'running';
         """))

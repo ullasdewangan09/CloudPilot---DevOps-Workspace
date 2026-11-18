@@ -55,3 +55,15 @@ CACHE_TTL_SUMMARY = int(os.getenv("CACHE_TTL_SUMMARY", 300))        # 5 minutes
 CACHE_TTL_LIST = int(os.getenv("CACHE_TTL_LIST", 120))              # 2 minutes
 CACHE_TTL_SYNC_STATUS = int(os.getenv("CACHE_TTL_SYNC_STATUS", 30))  # 30 seconds
 
+# ── Background Worker & Job Queue Configuration (Phase 3B.7) ─────────────────
+WORKER_POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", 2.0))             # Seconds between idle polls
+WORKER_HEARTBEAT_INTERVAL = float(os.getenv("WORKER_HEARTBEAT_INTERVAL", 15.0))  # Heartbeat update frequency
+WORKER_JOB_LEASE_SECONDS = int(os.getenv("WORKER_JOB_LEASE_SECONDS", 120))       # Heartbeat expiration timeout
+WORKER_MAX_ATTEMPTS = int(os.getenv("WORKER_MAX_ATTEMPTS", 3))                   # Maximum retries per job
+WORKER_INITIAL_RETRY_DELAY_SECONDS = int(os.getenv("WORKER_INITIAL_RETRY_DELAY_SECONDS", 10))
+WORKER_MAX_RETRY_DELAY_SECONDS = int(os.getenv("WORKER_MAX_RETRY_DELAY_SECONDS", 300))  # Max 5 min backoff
+WORKER_BACKOFF_FACTOR = float(os.getenv("WORKER_BACKOFF_FACTOR", 2.0))
+WORKER_GRACEFUL_SHUTDOWN_TIMEOUT = float(os.getenv("WORKER_GRACEFUL_SHUTDOWN_TIMEOUT", 30.0))
+SYNC_EXECUTION_MODE = os.getenv("SYNC_EXECUTION_MODE", "worker").lower().strip()
+
+

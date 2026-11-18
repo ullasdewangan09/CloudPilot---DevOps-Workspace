@@ -102,6 +102,11 @@ class CloudSyncJobResponse(CloudSyncJobBase):
     cloud_account_id: uuid.UUID
     workspace_id: uuid.UUID
     triggered_by_user_id: Optional[int] = None
+    worker_id: Optional[str] = None
+    attempts: int = 0
+    max_attempts: int = 3
+    heartbeat_at: Optional[datetime] = None
+    next_retry_at: Optional[datetime] = None
     started_at: datetime
     completed_at: Optional[datetime] = None
     created_at: datetime

@@ -302,6 +302,39 @@ class CloudSyncJob(Base):
         server_default="[]"
     )
 
+    # Worker ownership and execution tracking (Phase 3B.7)
+    worker_id = Column(
+        String(100),
+        nullable=True,
+        index=True
+    )
+
+    attempts = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0"
+    )
+
+    max_attempts = Column(
+        Integer,
+        nullable=False,
+        default=3,
+        server_default="3"
+    )
+
+    heartbeat_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True
+    )
+
+    next_retry_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True
+    )
+
     # Job lifecycle timestamps
     started_at = Column(
         DateTime(timezone=True),
